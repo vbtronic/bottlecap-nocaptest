@@ -13,4 +13,11 @@ torchrun --standalone --nproc_per_node=1 train_gpt2.py \
   --learning_rate 0.0018 \
   --warmup_iters 256 \
   --warmdown_iters 1024 \
+  --distill \
+  --distill_keep_ratio 0.70 \
+  --distill_min_keep 0.30 \
+  --distill_snapshot_interval 64 \
+  --distill_buffer_size 8 \
+  --distill_collapse_threshold 1.25 \
+  --target_val_loss 3.3821 \
   --log_wandb
