@@ -336,16 +336,62 @@ class DistributedDataLoader:
 
 
 # =============================================================================
-# ENTROPY-DRIVEN SELF-DISTILLATION (EDSD)
+# SMART FILTERING — Goldilocks Zone + Early Ejection
+#
+# Key idea (credit: Ondřej Plátek):
+#   Masking tokens in cross-entropy wastes GPU time on useless forward/backward
+#   passes.  Instead, filter at the CPU scorer level so invalid batches never
+#   reach the GPU at all (true Early Ejection, not just loss masking).
+#
+# Two-level filtering:
+#   1. Sequence level  — eject entire sequences outside the Goldilocks zone
+#   2. Token level     — mask residual easy tokens within kept sequences
+#
+# Goldilocks zone:  lo_threshold < mean_sequence_entropy < hi_threshold
+#   too easy  (entropy < lo): model already knows this → no gradient signal
+#   too noisy (entropy > hi): anomalous/garbage text → corrupts gradients
 # =============================================================================
+
+class GoldilocksFilter:
+    """
+    Tracks per-sequence entropy statistics and emits dynamic thresholds.
+    Warmup phase (first `warmup` batches): accepts everything.
+    """
+    def __init__(self, lo_sigma=1.0, hi_sigma=2.5, ema_alpha=0.99, warmup=20):
+        self.lo_sigma  = lo_sigma
+        self.hi_sigma  = hi_sigma
+        self.ema_alpha = ema_alpha
+        self.warmup    = warmup
+        self._count    = 0
+        self._ema_mean = None
+        self._ema_var  = None
+
+    def update(self, seq_entropy: torch.Tensor):
+        m = seq_entropy.mean().item()
+        v = float(seq_entropy.var().item()) if seq_entropy.numel() > 1 else 0.0
+        if self._ema_mean is None:
+            self._ema_mean, self._ema_var = m, max(v, 0.1)
+        else:
+            a = self.ema_alpha
+            self._ema_mean = a * self._ema_mean + (1 - a) * m
+            self._ema_var  = a * self._ema_var  + (1 - a) * max(v, 0.1)
+        self._count += 1
+
+    def thresholds(self):
+        """Return (lo, hi) entropy thresholds; (0, inf) during warmup."""
+        if self._ema_mean is None or self._count < self.warmup:
+            return 0.0, float("inf")
+        std = self._ema_var ** 0.5
+        return (self._ema_mean - self.lo_sigma * std,
+                self._ema_mean + self.hi_sigma * std)
+
 
 class DistillationController:
     """
-    Adapts distillation aggressiveness based on train/val divergence.
-    val/train > collapse_threshold → relax (risk of model collapse)
+    Adapts token-level keep_ratio based on train/val divergence.
+    val/train > collapse_threshold → relax (risk of overfitting to hard tokens)
     val/train < recovery_threshold → tighten (model is learning well)
     """
-
     def __init__(self, initial_keep_ratio=0.70, min_keep_ratio=0.30,
                  max_keep_ratio=1.00, collapse_threshold=1.25,
                  recovery_threshold=1.05, ema_alpha=0.95):
@@ -382,20 +428,24 @@ class DistillationController:
 
 class DistillationDataLoader:
     """
-    Async self-distillation pipeline.
+    Async Smart Filtering pipeline with Early Ejection.
 
-    Background thread scores raw batches via a stale CPU snapshot of the
-    training model.  Per-token Shannon entropy determines which targets to
-    keep (high entropy = model uncertain = informative) vs. mask to -1.
+    Background thread scores raw batches via a stale CPU snapshot.
+    Batches outside the Goldilocks entropy zone are EJECTED before the
+    GPU ever sees them — saving real forward/backward compute.
 
-    Scoring modes adapt automatically to measured queue-wait (idle) time:
-      full  (idle < 8 ms)  — all N layers, accurate entropy
-      light (idle < 25 ms) — first N//3 layers, fast approximation
-      raw   (idle ≥ 25 ms) — pass-through, keep_ratio bumped toward 1.0
+    Adaptive scoring depth (4 levels, chosen by GPU idle time):
+      deep       (idle ≤  3 ms) — all N layers
+      medium     (idle ≤  8 ms) — N//2 layers
+      light      (idle ≤ 20 ms) — N//4 layers  (≥1)
+      ultra_light(idle ≤ 50 ms) — 1 layer
+      raw        (idle >  50 ms) — pass-through (GPU starving)
     """
 
-    IDLE_LIGHT_MS = 8.0
-    IDLE_RAW_MS   = 25.0
+    IDLE_MEDIUM_MS      =  3.0
+    IDLE_LIGHT_MS       =  8.0
+    IDLE_ULTRALIGHT_MS  = 20.0
+    IDLE_RAW_MS         = 50.0
 
     def __init__(self, base_loader, model_config, controller,
                  buffer_size=8, snapshot_interval=64, train_device="cpu"):
@@ -403,22 +453,27 @@ class DistillationDataLoader:
         self.controller        = controller
         self.snapshot_interval = snapshot_interval
         self.train_device      = train_device
-        self._n_light          = max(1, model_config.n_layer // 3)
+
+        n = model_config.n_layer
+        self._n_deep        = n
+        self._n_medium      = max(1, n // 2)
+        self._n_light       = max(1, n // 4)
+        self._n_ultralight  = 1
 
         self._cpu_model = GPT(model_config)
         self._cpu_model.eval()
         self._snap_lock  = threading.Lock()
         self._snap_ready = False
 
-        # Idle stats — written by main thread, read by worker (GIL-safe)
-        self.idle_ms_ema    = 0.0
-        self.idle_ms_total  = 0.0
-        self.idle_count     = 0
-        self.scoring_mode   = "raw"
+        self._goldilocks = GoldilocksFilter()
 
-        # Distill quality stats — written by worker thread
+        # Stats (main-thread readable, GIL-safe scalars)
+        self.idle_ms_ema           = 0.0
+        self.idle_ms_total         = 0.0
+        self.idle_count            = 0
+        self.scoring_mode          = "raw"
         self.avg_keep_ratio        = 1.0
-        self.avg_entropy_threshold = 0.0
+        self.batches_per_output    = 1.0   # raw batches consumed per GPU batch
 
         self._q    = queue.Queue(maxsize=buffer_size)
         self._stop = threading.Event()
@@ -426,7 +481,7 @@ class DistillationDataLoader:
                                         name="distill-worker")
         self._thread.start()
 
-    # ── main-thread API ────────────────────────────────────────────────────
+    # ── main-thread API ───────────────────────────────────────────────────
 
     def update_snapshot(self, model: nn.Module, step: int):
         if step % self.snapshot_interval != 0:
@@ -447,18 +502,24 @@ class DistillationDataLoader:
         self.idle_count    += 1
 
         ema = self.idle_ms_ema
-        if ema >= self.IDLE_RAW_MS:
+        if ema > self.IDLE_RAW_MS:
             self.scoring_mode = "raw"
             self.controller.keep_ratio = min(self.controller.max_keep_ratio,
                                              self.controller.keep_ratio + 0.10)
-        elif ema >= self.IDLE_LIGHT_MS:
+        elif ema > self.IDLE_ULTRALIGHT_MS:
+            self.scoring_mode = "ultra_light"
+            self.controller.keep_ratio = min(self.controller.max_keep_ratio,
+                                             self.controller.keep_ratio + 0.05)
+        elif ema > self.IDLE_LIGHT_MS:
             self.scoring_mode = "light"
             self.controller.keep_ratio = min(self.controller.max_keep_ratio,
                                              self.controller.keep_ratio + 0.02)
+        elif ema > self.IDLE_MEDIUM_MS:
+            self.scoring_mode = "medium"
         else:
-            self.scoring_mode = "full"
+            self.scoring_mode = "deep"
 
-        return x.to(self.train_device), y.to(self.train_device)
+        return x, y
 
     def reset(self):
         self.base_loader.reset()
@@ -470,54 +531,92 @@ class DistillationDataLoader:
         self._stop.set()
         self._thread.join(timeout=5.0)
 
-    # ── background worker ──────────────────────────────────────────────────
+    # ── background worker ─────────────────────────────────────────────────
 
     def _worker(self):
+        consumed = 0
+        produced = 0
         while not self._stop.is_set():
+            x, y = None, None
             try:
-                x, y     = self.base_loader.next_batch()
-                mode      = self.scoring_mode if self._snap_ready else "raw"
-                x_d, y_d = self._distill(x, y, mode)
-                self._q.put((x_d, y_d))
+                x, y  = self.base_loader.next_batch()
+                mode  = self.scoring_mode if self._snap_ready else "raw"
+                result = self._score_and_filter(x, y, mode)
+                consumed += 1
+
+                if result is None:
+                    # Early Ejection: batch outside Goldilocks zone → skip GPU entirely
+                    continue
+
+                produced += 1
+                self.batches_per_output = consumed / max(1, produced)
+                self._q.put(result)
             except Exception:
                 import traceback; traceback.print_exc()
-                try: self._q.put((x, y))
-                except Exception: pass
+                if x is not None:
+                    try: self._q.put((x, y))
+                    except Exception: pass
 
-    def _distill(self, x: torch.Tensor, y: torch.Tensor, mode: str):
-        keep_ratio = self.controller.keep_ratio
-        if keep_ratio >= 1.0 or mode == "raw" or not self._snap_ready:
+    def _n_layers(self, mode: str) -> int:
+        return {
+            "deep":        self._n_deep,
+            "medium":      self._n_medium,
+            "light":       self._n_light,
+            "ultra_light": self._n_ultralight,
+        }.get(mode, self._n_deep)
+
+    def _score_and_filter(self, x: torch.Tensor, y: torch.Tensor, mode: str):
+        """
+        Returns (x, y_masked) if batch is in Goldilocks zone, else None.
+
+        Two-level filtering:
+          1. Sequence-level: eject sequences outside Goldilocks entropy range.
+          2. Token-level: mask easy tokens within kept sequences (one-sided —
+             only drop low-entropy tokens; high entropy is always kept since
+             that is the definition of the Goldilocks zone).
+        """
+        if mode == "raw" or not self._snap_ready:
             return x, y
 
+        n = self._n_layers(mode)
         with self._snap_lock:
             with torch.no_grad():
-                # Manual forward for all positions (B, T, V)
-                # GPT.forward() without targets only returns last-position logits
                 h = self._cpu_model.transformer.wte(x)
-                layers = list(self._cpu_model.transformer.h)
-                n = self._n_light if mode == "light" else len(layers)
-                for blk in layers[:n]:
+                for blk in list(self._cpu_model.transformer.h)[:n]:
                     h = blk(h)
                 h = rmsnorm(h)
-                logits = self._cpu_model.lm_head(h)   # (B, T, V)
+                logits = self._cpu_model.lm_head(h)  # (B, T, V)
 
         probs   = torch.softmax(logits.float(), dim=-1)
         entropy = -(probs * probs.clamp(min=1e-10).log()).sum(-1)  # (B, T)
 
-        flat   = entropy.reshape(-1)
-        n_keep = max(1, int(keep_ratio * flat.numel()))
-        k_rank = flat.numel() - n_keep
-        threshold = (flat.min().item() - 1.0) if k_rank <= 0 else \
-                    torch.kthvalue(flat, k_rank).values.item()
+        # ── 1. Sequence-level Goldilocks ──────────────────────────────────
+        seq_ent = entropy.mean(dim=-1)          # (B,)
+        self._goldilocks.update(seq_ent)
+        lo, hi  = self._goldilocks.thresholds()
+        keep_seq = (seq_ent >= lo) & (seq_ent <= hi)
 
-        mask   = entropy > threshold
-        actual = mask.float().mean().item()
+        if not keep_seq.any():
+            return None  # Early Ejection — entire batch outside zone
 
-        self.avg_keep_ratio        = 0.95 * self.avg_keep_ratio        + 0.05 * actual
-        self.avg_entropy_threshold = 0.95 * self.avg_entropy_threshold + 0.05 * threshold
-
+        # ── 2. Token-level masking within kept sequences ──────────────────
+        keep_ratio = self.controller.keep_ratio
         y_d = y.clone()
-        y_d[~mask] = -1
+
+        for i in range(x.size(0)):
+            if not keep_seq[i]:
+                y_d[i] = -1   # ejected sequence: mask all (won't affect loss)
+                continue
+            if keep_ratio < 1.0:
+                tok_ent = entropy[i]              # (T,)
+                n_keep  = max(1, int(keep_ratio * tok_ent.numel()))
+                k_rank  = tok_ent.numel() - n_keep
+                if k_rank > 0:
+                    lo_tok = torch.kthvalue(tok_ent, k_rank).values.item()
+                    y_d[i][tok_ent <= lo_tok] = -1  # mask easy tokens
+
+        n_kept = keep_seq.float().mean().item()
+        self.avg_keep_ratio = 0.95 * self.avg_keep_ratio + 0.05 * n_kept
         return x, y_d
 
 
@@ -871,6 +970,7 @@ if __name__ == "__main__":
         if isinstance(train_loader, DistillationDataLoader):
             tl = train_loader
             idle_tag = (f" | kept:{tl.avg_keep_ratio:.2f}"
+                        f" | consumed:{tl.batches_per_output:.1f}x"
                         f" | idle:{tl.idle_ms_ema:.1f}ms[{tl.scoring_mode}]")
 
         print0(

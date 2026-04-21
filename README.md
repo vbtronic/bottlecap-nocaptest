@@ -1,61 +1,81 @@
-# Entropy-Driven Self-Distillation for GPT-2
+# Smart Filtering for GPT-2
 
 **A submission to the [BottleCapAI NoCap-Test benchmark](https://github.com/BottleCapAI/NoCap-Test).**
 
-The core idea: not all tokens are equally useful for training. When a language model is already confident about a token, its gradient contribution is near zero. This implementation uses the model's own entropy to identify and focus training on the tokens that actually matter.
+The core idea: filter data *before* it reaches the GPU. Batches that provide no useful gradient signal are ejected at the CPU scorer — the GPU never wastes a forward/backward pass on them.
 
 ---
 
 ## The Idea
 
-Standard cross-entropy trains uniformly on every token in every batch. Most of those tokens are "easy" — the model already assigns high probability to the correct answer and learns little from them.
+Standard training wastes GPU compute on two kinds of tokens:
 
-**Entropy-Driven Self-Distillation (EDSD)** masks those easy tokens out:
+- **Too easy**: the model already assigns high probability to the correct token → gradient ≈ 0
+- **Too noisy**: garbage/anomalous text with extreme loss → corrupts gradients
 
-1. A background thread runs the current model (CPU snapshot) over each upcoming batch
-2. Per-token Shannon entropy is computed: `H(t) = -Σ p(v) · log p(v)`
-3. Only the top `keep_ratio` most uncertain tokens are kept — the rest get `target = -1` (ignored by cross-entropy)
-4. The main GPU training loop receives pre-scored batches with no added latency
+Simply masking these tokens in the cross-entropy loss still runs the full GPU forward/backward — the compute is wasted. The real speedup comes from **Early Ejection**: deciding before the GPU ever sees a batch.
 
-The model trains on the same data, same number of steps — but every gradient update comes from tokens the model is actually still learning from.
+### Goldilocks Zone Filtering
 
-```
-batch tokens:  [easy][easy][HARD][easy][HARD][HARD][easy][HARD]
-                  ↓      ↓    ↓     ↓     ↓     ↓     ↓     ↓
-cross-entropy:  [ -1 ][ -1 ][loss][ -1 ][loss][loss][ -1 ][loss]
-```
-
----
-
-## How it works
-
-### Async scoring pipeline
+We compute per-sequence entropy using a CPU snapshot of the model. Sequences outside the *Goldilocks zone* are ejected entirely:
 
 ```
-GPU (training)          CPU (scoring thread)
-─────────────           ──────────────────────
-train on batch t   ←── scored batch t (from queue)
-train on batch t+1 ←── scored batch t+1
-...                     scores batch t+2 using CPU snapshot
-                        scores batch t+3
-                        ...
+Entropy distribution across batches:
+
+ too easy │ ████ Goldilocks zone █████ │ too noisy
+──────────┼──────────────────────────────┼──────────
+  eject   │  ← train here only →        │  eject
+          lo_threshold             hi_threshold
 ```
 
-The CPU thread never blocks the GPU. If it falls behind, the system falls back to keeping all tokens (`raw` mode).
+Thresholds adapt dynamically as training progresses (EMA of entropy distribution). During warmup (first 20 batches), everything is accepted.
+
+### Two-level filtering
+
+```
+Raw batch from dataset
+       │
+       ▼ CPU scorer (async thread)
+  ┌─────────────────────────────────────────┐
+  │  1. Sequence level                      │
+  │     seq_entropy = mean(token entropy)   │
+  │     outside [lo, hi] → EJECT            │
+  │     (GPU never sees this batch)         │
+  │                                         │
+  │  2. Token level (within kept sequences) │
+  │     bottom keep_ratio tokens → mask -1  │
+  └─────────────────────────────────────────┘
+       │
+       ▼ Queue → GPU
+  GPU trains only on Goldilocks batches
+  with residual easy tokens masked
+```
+
+### Async pipeline — GPU never waits
+
+```
+GPU (training)              CPU (scoring thread)
+──────────────              ──────────────────────────────
+train on batch t       ←── Goldilocks batch t
+train on batch t+1     ←── Goldilocks batch t+1  (may have consumed
+...                         3 raw batches to find this one)
+```
+
+The CPU thread pre-filters raw batches and only delivers Goldilocks ones. If it falls behind, scoring depth drops automatically (4 levels: deep → medium → light → ultra_light → raw).
 
 ### Adaptive scoring depth
 
-The scorer adjusts how deeply it runs the CPU model based on how fast the GPU is consuming batches:
-
-| GPU idle time | Scoring mode | Layers used |
+| GPU idle time | Mode | Layers |
 |---|---|---|
-| < 8ms | `full` | all 12 |
-| 8–25ms | `light` | 4 |
-| > 25ms | `raw` | 0 (keep all) |
+| ≤ 3ms | `deep` | all 12 |
+| ≤ 8ms | `medium` | 6 |
+| ≤ 20ms | `light` | 3 |
+| ≤ 50ms | `ultra_light` | 1 |
+| > 50ms | `raw` | 0 (pass-through) |
 
 ### Anti-collapse controller
 
-Over-filtering can cause training to diverge from validation. The controller monitors the train/val loss ratio and automatically relaxes the `keep_ratio` if `val/train > 1.25`, preventing overfitting to a narrow token subset.
+If train/val diverge (over-filtering), `keep_ratio` is automatically relaxed to prevent the model from overfitting to a narrow token subset.
 
 ---
 
@@ -135,10 +155,16 @@ Full benchmark run (4768 steps to val_loss 3.3821) requires a CUDA GPU — **res
 
 | File | Description |
 |---|---|
-| `train_gpt2.py` | Training script with EDSD implementation |
+| `train_gpt2.py` | Training script with Smart Filtering implementation |
 | `run.sh` | Benchmark run (CUDA) |
 | `run_mps.sh` | Development run (Apple Silicon) |
 | `IDEA.md` | Detailed method description |
+
+---
+
+## Acknowledgements
+
+Thanks to **Ondřej Plátek** for the key insight that masking tokens in cross-entropy still wastes GPU compute — and that real savings require ejecting batches *before* the forward pass.
 
 ---
 

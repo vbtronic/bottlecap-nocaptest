@@ -1,12 +1,17 @@
-# Entropy-Driven Self-Distillation (EDSD)
+# Smart Filtering — Goldilocks Zone + Early Ejection
+
+*Thanks to Ondřej Plátek for the critical observation that moved us from loss masking to true Early Ejection.*
 
 ## Motivation
 
-Not all tokens are equally useful for training. When a language model already assigns high probability to the correct next token, the gradient contribution from that token is near zero — the model is not learning anything new. Conversely, tokens where the model is uncertain (high entropy over the vocabulary) carry strong gradient signal.
+Not all tokens are equally useful for training. Two categories waste GPU compute:
 
-Standard cross-entropy trains uniformly on all tokens, effectively wasting compute on "easy" tokens the model already handles correctly.
+- **Too easy**: model already assigns high probability to the correct token → gradient ≈ 0
+- **Too noisy**: extreme loss indicates garbage/anomalous text → corrupts gradients rather than helping
 
-**Hypothesis:** by masking easy tokens and training only on hard ones, we achieve better gradient signal per token and faster convergence to the same validation loss.
+Our original approach masked these tokens in the cross-entropy loss. The problem (pointed out by Ondřej Plátek): masking in loss still runs the full GPU forward/backward pass. The compute is wasted regardless of whether we count the loss contribution.
+
+**The fix:** eject bad batches *before* they reach the GPU. True Early Ejection.
 
 ## Method
 
