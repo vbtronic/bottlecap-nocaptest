@@ -65,8 +65,7 @@ def _newtonschulz5(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
         X = X.T
     for _ in range(steps):
         A = X @ X.T
-        B = b * A + c * (A @ A)
-        X = a * X + B @ X
+        X = a * X + (b * A + c * (A @ A)) @ X
     if transposed:
         X = X.T
     return X.to(G.dtype)
@@ -140,10 +139,8 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos], 3)
 
 
-def rmsnorm(x0, eps=1e-6):
-    x = x0.float()
-    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
-    return x.type_as(x0)
+def rmsnorm(x, eps=1e-6):
+    return F.rms_norm(x, (x.size(-1),), eps=eps)
 
 
 class CausalSelfAttention(nn.Module):
@@ -589,6 +586,8 @@ if __name__ == "__main__":
     parser.add_argument("--device",          type=str,   default="")
     parser.add_argument("--target_val_loss", type=float, default=0.0,
                         help="Stop early when val_loss ≤ this value (0 = disabled)")
+    parser.add_argument("--grad_clip",       type=float, default=1.0,
+                        help="Gradient clipping norm (0 = disabled)")
     args = parser.parse_args()
 
     B, T = args.batch_size, args.sequence_length
@@ -636,6 +635,9 @@ if __name__ == "__main__":
     # ── Autocast + inductor ───────────────────────────────────────────────
     ctx = make_autocast_ctx(device_type)
     if device_type == "cuda":
+        # TF32: free ~2x matmul throughput on Ampere+ with negligible precision loss
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         try:
             import torch._inductor.config as ic
             if hasattr(ic, "coordinate_descent_tuning"):
@@ -667,7 +669,7 @@ if __name__ == "__main__":
 
     if args.compile and device_type == "cuda":
         print0("compiling the model...")
-        model = torch.compile(model)
+        model = torch.compile(model, mode="reduce-overhead")
 
     if use_ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
@@ -849,6 +851,8 @@ if __name__ == "__main__":
 
         ratio = get_lr_ratio(step)
         set_lrs(ratio)
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         for opt in optimizers:
             opt.step()
             opt.zero_grad(set_to_none=True)

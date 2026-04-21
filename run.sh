@@ -20,4 +20,5 @@ torchrun --standalone --nproc_per_node=1 train_gpt2.py \
   --distill_buffer_size 8 \
   --distill_collapse_threshold 1.25 \
   --target_val_loss 3.3821 \
+  --compile \
   --log_wandb
