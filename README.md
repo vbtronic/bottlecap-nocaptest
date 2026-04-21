@@ -1,163 +1,145 @@
-# GPT-2 Benchmark
+# Entropy-Driven Self-Distillation for GPT-2
 
-![logo](img/logo.png)
-Hey there! Are you interested in LLMs? Do you like experimenting with neural networks, implementing different ideas and testing them out? Would you like to do that for a living? Then you're in the right place!
-This is an official open test for people interested in joining [BottleCapAI](https://www.bottlecapai.com).
+**A submission to the [BottleCapAI NoCap-Test benchmark](https://github.com/BottleCapAI/NoCap-Test).**
 
-This project is a fork of [Modded-NanoGPT](https://github.com/KellerJordan/modded-nanogpt) :heart:, rewritten with minimal changes to run on a single GPU (e.g. RTX 3090/4090)
-
----
-## 📌 About BottleCapAI
-
-At **BottleCapAI**, we’re making large language models **radically more efficient** — aiming for **100× improvements** over today’s approaches. 🚀  
-
-### 👥 Founders
-- Tomas Mikolov – creator of *word2vec*, pioneer of neural language models.  
-- Jaroslav Beck – co-founder of *Beat Games* (*Beat Saber*, 10M+ copies sold, acquired by Meta).  
-- David Herel – creator of Thinking Tokens, co-founder of an AI trading startup, and Amazon Alexa Prize finalist.
-
-### 🌍 Our vision
-Training frontier LLMs costs **tens of millions** today. Our new algorithms already cut that by **~50%** — and we’re just getting started. We’re building a European hub to push AI forward through **algorithms, not brute force**.  
- 
-📧 **hey(at)bottlecapai.com** · 🌐 [bottlecapai.com](https://www.bottlecapai.com)  
+The core idea: not all tokens are equally useful for training. When a language model is already confident about a token, its gradient contribution is near zero. This implementation uses the model's own entropy to identify and focus training on the tokens that actually matter.
 
 ---
 
-## 🏆 First Competition has Finished. 
+## The Idea
 
-**Your self-paced submissions are always welcome! Competition or no-competition, let us know if you have speed up!💪**
+Standard cross-entropy trains uniformly on every token in every batch. Most of those tokens are "easy" — the model already assigns high probability to the correct answer and learns little from them.
 
-**[Update November 13: We have winners! See the anouncement 🏆](https://x.com/BottleCapAI/status/1989014669806432502?s=20)**
-- **1st place:** $3,000 USD  Jan Chleboun
-- **2nd place:** $2,000 USD  Andrej Nosov
-- **3rd place:** $1,000 USD  Dominik Jurko
+**Entropy-Driven Self-Distillation (EDSD)** masks those easy tokens out:
 
-Competition deadline: 11.11.2025.
-Prizes were awarded based on the best validated results shared via the submission process below. Ties may be broken by total training time and clarity of write-up.
+1. A background thread runs the current model (CPU snapshot) over each upcoming batch
+2. Per-token Shannon entropy is computed: `H(t) = -Σ p(v) · log p(v)`
+3. Only the top `keep_ratio` most uncertain tokens are kept — the rest get `target = -1` (ignored by cross-entropy)
+4. The main GPU training loop receives pre-scored batches with no added latency
 
----
+The model trains on the same data, same number of steps — but every gradient update comes from tokens the model is actually still learning from.
 
-## Objective
-
-Prototype your idea on a subset of the **FineWeb** dataset using **1 GPU**.  
-**(Optional) goal:** reach a validation loss of **≤ 3.3821** faster than the baseline.
-
-You can achieve this by:
-- making your model faster (so that it sees more data in shorter time)
-- making your training more efficient (so that in less steps your model makes better progress).
+```
+batch tokens:  [easy][easy][HARD][easy][HARD][HARD][easy][HARD]
+                  ↓      ↓    ↓     ↓     ↓     ↓     ↓     ↓
+cross-entropy:  [ -1 ][ -1 ][loss][ -1 ][loss][loss][ -1 ][loss]
+```
 
 ---
 
-## What's the point?
+## How it works
 
-We're not here to optimize learning rates and torch.compile flags.  
-We're here to explore **algorithmic ideas that might scale**, and if that means writing your own CUDA kernel, even better.
+### Async scoring pipeline
 
-This benchmark is meant for:
-- People with limited hardware
-- People with ideas and curiosity
+```
+GPU (training)          CPU (scoring thread)
+─────────────           ──────────────────────
+train on batch t   ←── scored batch t (from queue)
+train on batch t+1 ←── scored batch t+1
+...                     scores batch t+2 using CPU snapshot
+                        scores batch t+3
+                        ...
+```
 
-You're encouraged to try new techniques to speed up language modeling such as but not exclusively:
-- Modify the loss function
-- Add auxiliary losses (multi-token prediction?)
-- Modify the architecture (Mixture of Experts? Different attention?)
-- Come up with a different training algorithm
-- Modify the training data
-- New architecture!
+The CPU thread never blocks the GPU. If it falls behind, the system falls back to keeping all tokens (`raw` mode).
 
-You're **not** expected to:
-- Just bump up the learning rate
-- Beat everyone with hyperparameter magic
-- Do 50 runs to grid search Adam betas
-- Benchmark arcane PyTorch flags
-- Copy speedups from [Modded-NanoGPT](https://github.com/KellerJordan/modded-nanogpt)
-- Modify a specific hidden layer size to align better with the number of TensorCores on your GPU 
+### Adaptive scoring depth
 
-We're interested in your own ideas, not how well you can copy other's. These ideas should be general and work on different setups and not be hardcoded to a very specific one.
+The scorer adjusts how deeply it runs the CPU model based on how fast the GPU is consuming batches:
 
-You have a budget of **5B** tokens available for training, but the baseline only uses **2.5B**, so you've got room to train on more data if you make your model faster, or on less but *better* data. 
+| GPU idle time | Scoring mode | Layers used |
+|---|---|---|
+| < 8ms | `full` | all 12 |
+| 8–25ms | `light` | 4 |
+| > 25ms | `raw` | 0 (keep all) |
 
-The dataset is pre-tokenized so that you don't have to do that yourself (saves time) but if you want to explore the original text, you can decode it using the GPT-2 tokenizer (`tiktoken.get_encoding("gpt2")`).
+### Anti-collapse controller
+
+Over-filtering can cause training to diverge from validation. The controller monitors the train/val loss ratio and automatically relaxes the `keep_ratio` if `val/train > 1.25`, preventing overfitting to a narrow token subset.
 
 ---
 
-## Running the baseline 
+## Running
 
-To run the baseline, run the following commands.
+### Requirements
+
 ```bash
-git clone https://github.com/BottleCapAI/modded-nanogpt && cd modded-nanogpt
 pip install -r requirements.txt
+python data/cached_fineweb10B.py  # downloads ~100GB FineWeb dataset
+```
 
-# you can skip this if you don't want to use W&B, in which case you should remove the --log_wandb argument from run.sh
-wandb login
-wandb sync wandb/run-20250410_203158-64s1zc1w # synchronizes the baseline run to your W&B account for reference
+### CUDA (benchmark — RTX 3090/4090 or similar)
 
-python data/cached_fineweb10B.py
+```bash
 ./run.sh
 ```
 
----
+This runs the full benchmark: AdamW + EDSD, 4768 steps, 2.5B tokens, stops automatically at val_loss ≤ 3.3821.
 
-## Benchmarks
+### Apple Silicon (development/testing)
 
-Below is a reference leaderboard. Beating it is awesome, but **sub-baseline runs are still valuable when they demonstrate a creative idea.**
-
-**Train a neural network to ≤ 3.3821 validation loss on FineWeb using 1 GPU.**
-
-| # | Record time | Description                                                   | Date     | Log | Contributors |
-| - | - |---------------------------------------------------------------|----------|-----| - |
-1 | 5.401 hours | [baseline](https://github.com/KellerJordan/modded-nanogpt) | 11/04/25 | [log](pylog124M/14e37fbb-cc64-4185-a1a7-5ef956b56ac7.log)   | [contributors-of-modded-nanoGPT](https://github.com/KellerJordan/modded-nanogpt)
-2 | 4.86 hours | gated embedding projection | 20/08/25 | -   | [adam-osusky](https://github.com/adam-osusky)
-3 | 3.88 hours | custom attention mask, increased context length, variable context length | 28/06/25 | -   | [filipmihal](https://github.com/filipmihal)
-
-
-
-Note: The baseline used one RTX 4090. It took 4768 steps/iterations and used in total 2.5B tokens.
-
-![wandb_loss](img/wandb_loss.png)
-
-## Rules
-
-1. **Optional:** reach validation loss ≤ 3.3821 in shorter time.
-2. Do **not** introduce new datasets, but feel free to modify the current.
-3. Document your idea in `IDEA.md` (motivation, method, results). Negative results are welcome—share what you learned!
-
-If you use a different GPU than RTX 4090, benchmark the baseline and compare your speedup to that result, for example, if the baseline takes 10 hours on your setup, but your solution takes only 8 hours, then thats your speedup that you can report to us! Keep the comparison fair, if you increase the learning rate for your solution, try increasing it also for the baseline.
-
-## Submission
-
-To submit your results, run:
 ```bash
-git bundle create <first name>-<last name>.bundle --all
+./run_mps.sh
 ```
-Then send us your .bundle file to hey(at)bottlecapai.com with subject in format: \<first name\>-\<last name\> \<percentage speedup (dont worry if it's negative)\>.
 
-**Didn’t beat the baseline?** No worries – send the bundle anyway **plus a short `IDEA.md`** describing:  
-• what you tried & why 
-• what worked 
-• what didn’t.  
-
-**Beat the baseline?** Great! Add a `RESULTS.md` with timing, settings, and hardware so others can reproduce it.
-
-At this moment, we are interested mainly in candidates willing to relocate to Prague. (If you’re an exceptional fit, we’re happy to discuss possible support options.)
-
----
-## Technical Notes
-
-While this project is designed to run on **1 GPU**, there are a few things to keep in mind:
-
-- Batch Size, Sequence Length and Gradient Accumulation:
-  The current setup requires ~ 13GB of GPU memory, which might not be available to you (if you have no GPU we suggest using [Google Colab](!https://colab.research.google.com/)), in which case, you might need to tune down some hyperparameters. We recommend starting with validation batch size - this one will not affect performance but validation will take a bit longer. Next, you might tune down batch size which you might then compensate by increasing gradient accumulation to retain the same effective batch size, be careful about changing learning rate and other hyperparameters should you change effective batch size.
-
-- **torch.compile Considerations:**  
-  On some RTX cards, aggressive kernel auto-tuning via `torch.compile` can lead to shared memory issues. If you encounter errors or persistent warnings (e.g., about insufficient SMs for max autotune GEMM mode), you may have to **disable `torch.compile`** or adjust your model settings accordingly. Although this may lead to slightly slower performance, it typically resolves hardware compatibility issues.
-
-- Multi-GPU Runs:
-  This code should be ready for distributed training, if you happen to have access to multiple GPUs. In that case, make sure that Gradient Accumulation Steps is divisible by number of GPUs.
+Adapted for MPS (Metal): float32, batch_size=8, grad_accum=64, same total token budget.
 
 ---
 
-### Comment on the target metric
+## Key parameters
 
-The target metric is cross-entropy loss on the FineWeb val set. The goal of the speedrun is to obtain a probability model of language which assigns a probability of at least `math.exp(-3.3821 * 1048576)` to the first 1,048,576 tokens of the FineWeb valset. Hence, we allow evaluation at any sequence length, so long as we still have a valid probability model of language on the **entire** validation set.
+| Flag | Default | Description |
+|---|---|---|
+| `--distill` | off | Enable EDSD |
+| `--distill_keep_ratio` | 0.70 | Keep top 70% hardest tokens |
+| `--distill_min_keep` | 0.30 | Never drop below 30% |
+| `--distill_snapshot_interval` | 64 | Refresh CPU snapshot every N steps |
+| `--distill_buffer_size` | 8 | Pre-scored batch queue size |
+| `--distill_collapse_threshold` | 1.25 | Relax filter if val/train diverges |
+| `--target_val_loss` | 0 | Stop early at this val_loss (e.g. 3.3821) |
 
+---
+
+## Verified behavior
+
+3-step test on Apple M5 (MPS, 32GB):
+
+```
+step:0 | val_loss 10.987275
+step:1 | val_loss  9.575774   (−1.41)
+step:2 | val_loss  8.447386   (−1.13)
+step:3 | val_loss  7.793463   (−0.65)
+peak memory: 31.3 GiB  — no OOM
+distill idle: 0.8% of walltime  — scorer keeps up
+```
+
+Loss decreases cleanly. Distillation overhead is negligible. No crashes.
+
+Full benchmark run (4768 steps to val_loss 3.3821) requires a CUDA GPU — **results welcome**.
+
+---
+
+## Architecture
+
+- GPT-2 124M (`d12`: 12 layers, 12 heads, 768 dim)
+- RoPE positional embeddings
+- Flash attention (`F.scaled_dot_product_attention`)
+- RMSNorm (`F.rms_norm`)
+- Weight tying (embedding ↔ lm_head)
+- AdamW optimizer (standard baseline)
+- CUDA: bfloat16 autocast | MPS: float32
+
+---
+
+## Files
+
+| File | Description |
+|---|---|
+| `train_gpt2.py` | Training script with EDSD implementation |
+| `run.sh` | Benchmark run (CUDA) |
+| `run_mps.sh` | Development run (Apple Silicon) |
+| `IDEA.md` | Detailed method description |
+
+---
+
+*Fork of [BottleCapAI/NoCap-Test](https://github.com/BottleCapAI/NoCap-Test), which is based on [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt).*
