@@ -1,4 +1,8 @@
 data/fineweb10B/
 pylog124M/
+pylog124M_mps/
+pylog_*.txt
 logs/
 wandb/
+.venv/
+__pycache__/

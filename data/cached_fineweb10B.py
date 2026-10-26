@@ -17,8 +17,8 @@ def get(fname):
 
 
 get("fineweb_val_%06d.bin" % 0)
-num_chunks = (
-    50  # Each chunk is 100M tokens, so this is 5B tokens. NOTE: do not add more chunks.
-)
+# Each chunk is 100M tokens, 50 chunks = the 5B token budget. NOTE: do not add more chunks.
+# Optional argument: download fewer chunks (e.g. 8 for a short Colab run).
+num_chunks = min(int(sys.argv[1]), 50) if len(sys.argv) > 1 else 50
 for i in range(1, num_chunks + 1):
     get("fineweb_train_%06d.bin" % i)

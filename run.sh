@@ -1,3 +1,6 @@
+#!/usr/bin/env bash
+# Smart Filtering run — identical to the upstream baseline run.sh except for the --smart_filter flags
+# and early stopping at the target val loss. Run ./run_baseline.sh on the same GPU to compare.
 torchrun --standalone --nproc_per_node=1 train_gpt2.py \
   --input_bin "data/fineweb10B/fineweb_train_*.bin" \
   --input_val_bin "data/fineweb10B/fineweb_val_*.bin" \
@@ -13,12 +16,10 @@ torchrun --standalone --nproc_per_node=1 train_gpt2.py \
   --learning_rate 0.0018 \
   --warmup_iters 256 \
   --warmdown_iters 1024 \
-  --no_muon \
-  --distill \
-  --distill_keep_ratio 0.70 \
-  --distill_min_keep 0.30 \
-  --distill_snapshot_interval 64 \
-  --distill_buffer_size 8 \
-  --distill_collapse_threshold 1.25 \
   --target_val_loss 3.3821 \
-  --log_wandb
+  --smart_filter \
+  --filter_pool 1.25 \
+  --filter_hard_frac 0.5 \
+  --filter_score_len 256 \
+  --filter_warmup 128 \
+  "$@"

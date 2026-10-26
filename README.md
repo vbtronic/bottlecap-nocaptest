@@ -1,171 +1,63 @@
 # Smart Filtering for GPT-2
 
-**A submission to the [BottleCapAI NoCap-Test benchmark](https://github.com/BottleCapAI/NoCap-Test).**
+A submission to the [BottleCapAI NoCap-Test benchmark](https://github.com/BottleCapAI/NoCap-Test):
+train GPT-2 124M on FineWeb to **val loss ≤ 3.3821** faster than the baseline (5.401 h on one RTX 4090,
+4768 steps, 2.5B tokens; up to 5B tokens allowed).
 
-The core idea: filter data *before* it reaches the GPU. Batches that provide no useful gradient signal are ejected at the CPU scorer — the GPU never wastes a forward/backward pass on them.
-
----
-
-## The Idea
-
-Standard training wastes GPU compute on two kinds of tokens:
-
-- **Too easy**: the model already assigns high probability to the correct token → gradient ≈ 0
-- **Too noisy**: garbage/anomalous text with extreme loss → corrupts gradients
-
-Simply masking these tokens in the cross-entropy loss still runs the full GPU forward/backward — the compute is wasted. The real speedup comes from **Early Ejection**: deciding before the GPU ever sees a batch.
-
-### Goldilocks Zone Filtering
-
-We compute per-sequence entropy using a CPU snapshot of the model. Sequences outside the *Goldilocks zone* are ejected entirely:
+**Idea:** spend the unused token budget on *reading* more data, and train only on the sequences in the
+Goldilocks zone. Each micro-batch draws 25% extra candidates, the live model scores them on a short prefix,
+and the easiest and noisiest ones are ejected before the forward/backward pass. Details and the history of
+the first, broken version are in [IDEA.md](IDEA.md).
 
 ```
-Entropy distribution across batches:
-
- too easy │ ████ Goldilocks zone █████ │ too noisy
-──────────┼──────────────────────────────┼──────────
-  eject   │  ← train here only →        │  eject
-          lo_threshold             hi_threshold
+pool of 20 sequences ──► score (live model, no_grad, first 256 tokens) ──► sort by loss
+                                                                             │
+          eject 2 easiest ◄──────────────────────────────────────────────────┤
+          eject 2 hardest ◄──────────────────────────────────────────────────┤
+                                                                             ▼
+                                                   train on the middle 16 (as baseline)
 ```
-
-Thresholds adapt dynamically as training progresses (EMA of entropy distribution). During warmup (first 20 batches), everything is accepted.
-
-### Two-level filtering
-
-```
-Raw batch from dataset
-       │
-       ▼ CPU scorer (async thread)
-  ┌─────────────────────────────────────────┐
-  │  1. Sequence level                      │
-  │     seq_entropy = mean(token entropy)   │
-  │     outside [lo, hi] → EJECT            │
-  │     (GPU never sees this batch)         │
-  │                                         │
-  │  2. Token level (within kept sequences) │
-  │     bottom keep_ratio tokens → mask -1  │
-  └─────────────────────────────────────────┘
-       │
-       ▼ Queue → GPU
-  GPU trains only on Goldilocks batches
-  with residual easy tokens masked
-```
-
-### Async pipeline — GPU never waits
-
-```
-GPU (training)              CPU (scoring thread)
-──────────────              ──────────────────────────────
-train on batch t       ←── Goldilocks batch t
-train on batch t+1     ←── Goldilocks batch t+1  (may have consumed
-...                         3 raw batches to find this one)
-```
-
-The CPU thread pre-filters raw batches and only delivers Goldilocks ones. If it falls behind, scoring depth drops automatically (4 levels: deep → medium → light → ultra_light → raw).
-
-### Adaptive scoring depth
-
-| GPU idle time | Mode | Layers |
-|---|---|---|
-| ≤ 3ms | `deep` | all 12 |
-| ≤ 8ms | `medium` | 6 |
-| ≤ 20ms | `light` | 3 |
-| ≤ 50ms | `ultra_light` | 1 |
-| > 50ms | `raw` | 0 (pass-through) |
-
-### Anti-collapse controller
-
-If train/val diverge (over-filtering), `keep_ratio` is automatically relaxed to prevent the model from overfitting to a narrow token subset.
-
----
 
 ## Running
 
-### Requirements
+### Google Colab
+
+Open [`colab.ipynb`](https://colab.research.google.com/github/vbtronic/bottlecap-nocaptest/blob/main/colab.ipynb),
+pick a GPU runtime and run all cells. It trains the baseline and Smart Filtering on the same GPU and plots both.
+The `quick` preset (157M tokens) fits a free T4; the `full` preset needs an A100/L4.
+
+### Local CUDA GPU
 
 ```bash
 pip install -r requirements.txt
-python data/cached_fineweb10B.py  # downloads ~100GB FineWeb dataset
+python data/cached_fineweb10B.py 33   # 33 × 100M tokens (Smart Filtering reads ~3.1B)
+./run_baseline.sh                     # upstream baseline, same GPU, for a fair comparison
+./run.sh                              # Smart Filtering
 ```
 
-### CUDA (benchmark — RTX 3090/4090 or similar)
+Both scripts stop at val loss ≤ 3.3821. Extra flags are passed through, e.g. `./run.sh --log_wandb`.
+On GPUs without bf16 (T4, V100) training uses fp16 with a gradient scaler.
+
+### Smoke test (CPU / Apple Silicon)
 
 ```bash
-./run.sh
+python train_gpt2.py --batch_size 4 --sequence_length 256 --val_batch_size 64 --val_loss_every 10 \
+  --num_iterations 20 --learning_rate 0.0018 --smart_filter --filter_warmup 5 --filter_score_len 64
 ```
 
-This runs the full benchmark: AdamW + EDSD, 4768 steps, 2.5B tokens, stops automatically at val_loss ≤ 3.3821.
+## Smart Filtering flags
 
-### Apple Silicon (development/testing)
-
-```bash
-./run_mps.sh
-```
-
-Adapted for MPS (Metal): float32, batch_size=8, grad_accum=64, same total token budget.
-
----
-
-## Key parameters
-
-| Flag | Default | Description |
+| Flag | Default | Meaning |
 |---|---|---|
-| `--distill` | off | Enable EDSD |
-| `--distill_keep_ratio` | 0.70 | Keep top 70% hardest tokens |
-| `--distill_min_keep` | 0.30 | Never drop below 30% |
-| `--distill_snapshot_interval` | 64 | Refresh CPU snapshot every N steps |
-| `--distill_buffer_size` | 8 | Pre-scored batch queue size |
-| `--distill_collapse_threshold` | 1.25 | Relax filter if val/train diverges |
-| `--target_val_loss` | 0 | Stop early at this val_loss (e.g. 3.3821) |
+| `--smart_filter` | off | enable filtering (off = exact baseline) |
+| `--filter_pool` | 1.25 | candidates read per kept sequence |
+| `--filter_hard_frac` | 0.5 | share of ejected sequences taken from the hard end |
+| `--filter_score_len` | 256 | tokens per candidate used for scoring |
+| `--filter_warmup` | 128 | steps without filtering at the start |
+
+Other additions over upstream: `--target_val_loss`, `--grad_clip` (off), `--save_every` / `--resume`
+(model, optimizer and data position), `--no_compile`, CPU/MPS fallback for smoke tests.
 
 ---
 
-## Verified behavior
-
-3-step test on Apple M5 (MPS, 32GB):
-
-```
-step:0 | val_loss 10.987275
-step:1 | val_loss  9.575774   (−1.41)
-step:2 | val_loss  8.447386   (−1.13)
-step:3 | val_loss  7.793463   (−0.65)
-peak memory: 31.3 GiB  — no OOM
-distill idle: 0.8% of walltime  — scorer keeps up
-```
-
-Loss decreases cleanly. Distillation overhead is negligible. No crashes.
-
-Full benchmark run (4768 steps to val_loss 3.3821) requires a CUDA GPU — **results welcome**.
-
----
-
-## Architecture
-
-- GPT-2 124M (`d12`: 12 layers, 12 heads, 768 dim)
-- RoPE positional embeddings
-- Flash attention (`F.scaled_dot_product_attention`)
-- RMSNorm (`F.rms_norm`)
-- Weight tying (embedding ↔ lm_head)
-- AdamW optimizer (standard baseline)
-- CUDA: bfloat16 autocast | MPS: float32
-
----
-
-## Files
-
-| File | Description |
-|---|---|
-| `train_gpt2.py` | Training script with Smart Filtering implementation |
-| `run.sh` | Benchmark run (CUDA) |
-| `run_mps.sh` | Development run (Apple Silicon) |
-| `IDEA.md` | Detailed method description |
-
----
-
-## Acknowledgements
-
-Thanks to **Ondřej Plátek** for the key insight that masking tokens in cross-entropy still wastes GPU compute — and that real savings require ejecting batches *before* the forward pass.
-
----
-
-*Fork of [BottleCapAI/NoCap-Test](https://github.com/BottleCapAI/NoCap-Test), which is based on [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt).*
+*Fork of [BottleCapAI/NoCap-Test](https://github.com/BottleCapAI/NoCap-Test), based on [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt).*

@@ -1,84 +1,59 @@
 # Smart Filtering — Goldilocks Zone + Early Ejection
 
-*Thanks to Ondřej Plátek for the critical observation that moved us from loss masking to true Early Ejection.*
+*Thanks to Ondřej Plátek for the key observation: masking tokens in the loss still pays for the full
+forward/backward pass, so real savings only come from data that never reaches the GPU.*
 
 ## Motivation
 
-Not all tokens are equally useful for training. Two categories waste GPU compute:
+Not every sequence in FineWeb is equally useful for a 124M model:
 
-- **Too easy**: model already assigns high probability to the correct token → gradient ≈ 0
-- **Too noisy**: extreme loss indicates garbage/anomalous text → corrupts gradients rather than helping
+- **Too easy** — boilerplate, repeated navigation text, things the model already predicts well. Small loss, small gradient.
+- **Too hard** — tables, minified code, other languages, spam. High loss that is mostly irreducible noise.
 
-Our original approach masked these tokens in the cross-entropy loss. The problem (pointed out by Ondřej Plátek): masking in loss still runs the full GPU forward/backward pass. The compute is wasted regardless of whether we count the loss contribution.
-
-**The fix:** eject bad batches *before* they reach the GPU. True Early Ejection.
+The budget allows 5B training tokens while the baseline trains on 2.5B. Smart Filtering spends part of that
+spare budget on *reading* more data and only *trains* on the sequences in the middle — the Goldilocks zone.
 
 ## Method
 
-### Token scoring
+For every micro-batch of `B` sequences:
 
-We use the model's own output distribution to compute per-token entropy:
+1. Read a candidate pool of `ceil(B * filter_pool)` sequences (default 1.25 → 20 candidates for B = 16).
+2. Score each candidate with the **live** training model under `no_grad`: mean cross-entropy over the first
+   `filter_score_len` tokens (default 256 of 1024).
+3. Sort by score and eject the easiest `(1 - hard_frac)` and hardest `hard_frac` share of the surplus
+   (default 2 + 2 sequences).
+4. Train on the remaining `B` sequences exactly as the baseline does.
 
-```
-H(t) = -Σ p(v|context) · log p(v|context)
-```
+Scoring cost: a forward pass is ~1/3 of forward+backward, and scoring touches 1.25 × 1/4 of the tokens,
+so the overhead is roughly 1.25 × 1/4 × 1/3 ≈ **10% per step**. Scoring time is counted as training time.
+The filter is off for the first `filter_warmup` steps (default 128), while the model's scores are still noise.
+Validation always uses the unfiltered validation set.
 
-A high entropy means the model is uncertain → the token is hard → keep it.  
-A low entropy means the model is confident → easy token → mask it out.
+Data use with the defaults: 128 × 0.52M + 4640 × 0.66M ≈ 3.1B tokens read, within the 5B budget.
 
-### Asynchronous distillation pipeline
+For the method to win, the step-for-step improvement from better data has to beat the ~10% slowdown per step.
 
-Scoring every batch in the forward pass would add latency to training. Instead:
+## History — what the first version did wrong
 
-1. A **background thread** maintains a CPU copy of the model (snapshot).
-2. While the GPU trains on batch `t`, the CPU thread pre-scores batch `t+k`.
-3. Scored batches go into a queue; the training loop consumes them without waiting.
+The first version (April 2026, commits `0882d9a`..`8870eb5`) had the same goal but did not work:
 
-The CPU snapshot is refreshed every `--distill_snapshot_interval` steps so scores stay reasonably up to date.
-
-### Token selection
-
-For each batch, we sort tokens by entropy and keep the top `keep_ratio` fraction. Masked tokens have their target set to `-1` (PyTorch `cross_entropy` ignore_index), so they contribute zero loss and zero gradient.
-
-### Anti-collapse controller
-
-If the model over-filters, it may stop improving on validation even while train loss drops. A controller monitors the train/val loss ratio and automatically relaxes `keep_ratio` when `val/train > collapse_threshold`, preventing the training from becoming too narrow.
-
-### Adaptive scoring modes
-
-The background thread adapts its depth based on idle time:
-- **full** (all 12 layers): when GPU is waiting for data → use full model
-- **light** (4 layers): when GPU is slightly ahead
-- **raw** (no scoring, keep all): when GPU would stall waiting for scorer
-
-This ensures the distillation pipeline never becomes a bottleneck.
-
-## Hyperparameters
-
-| Parameter | Value | Description |
-|---|---|---|
-| `--distill_keep_ratio` | 0.70 | Keep top 70% hardest tokens |
-| `--distill_min_keep` | 0.30 | Never drop below 30% (floor) |
-| `--distill_snapshot_interval` | 64 | Refresh CPU snapshot every 64 steps |
-| `--distill_buffer_size` | 8 | Pre-scored batch queue depth |
-| `--distill_collapse_threshold` | 1.25 | Relax filter if val/train ratio > 1.25 |
+| Problem | Effect |
+|---|---|
+| Scored with a full 124M copy of the model **on the CPU**, building `(B, T, 50257)` fp32 logits (~3 GB per batch) | The CPU is orders of magnitude slower than the GPU it was supposed to feed. The scorer fell back to "raw" pass-through, so in practice nothing was filtered. |
+| "Early Ejection" dropped a batch only when *all* sequences were out of the zone; otherwise out-of-zone sequences were masked with `-1` | The GPU still ran the forward/backward on them. No compute was saved. |
+| Token-level masking of the lowest-entropy 30% of tokens | Again no compute saved; it also shrinks the effective batch. Low entropy ≠ low loss: confidently wrong tokens, the most informative ones, were thrown away. |
+| Collapse controller compared val loss with train loss computed on *hard* tokens only | Train loss is always higher than val loss there, so the ratio never triggered and `keep_ratio` just decayed to the minimum. |
+| Snapshot lock held for the whole CPU forward | The training loop blocked on `update_snapshot`. |
+| Every raw-mode batch increased `keep_ratio` by 0.10 | The filter switched itself off. |
+| Muon optimizer and multi-token prediction heads on by default in `run_mps.sh` | Muon is a modded-nanogpt speedup (not allowed); MTP heads added 2 × 38M parameters and caused the MPS OOM. |
+| No `torch.compile` in our run while the baseline compiles | Unfair comparison against ourselves. |
+| A ~1.5 GB checkpoint every 256 steps; resuming did not restore the data loader position | Fills the disk; a resumed run retrained on data it had already seen. |
 
 ## Results
 
-Tested on Apple M5 (MPS, 32GB) — local development only, not benchmark hardware.
+Pending — run `colab.ipynb` (baseline and Smart Filtering on the same GPU).
 
-- 3-step sanity check: val_loss 10.987 → 9.576 → 8.447 → 7.793 (clean convergence, no OOM)
-- No full CUDA run completed yet (no RTX 4090 available for testing)
-
-## Why this should work
-
-Curriculum learning literature consistently shows that training on harder examples improves sample efficiency. EDSD implements a soft, adaptive curriculum: the model itself decides which tokens are "already known" vs "still learning." Unlike static curricula, this self-updates as the model improves.
-
-The background async pipeline ensures the technique adds near-zero wall-clock overhead to each training step.
-
-## What didn't work / open questions
-
-- MTP (multi-token prediction) caused OOM on MPS with large vocab (50257) — disabled
-- The keep_ratio of 0.70 is a guess; optimal value likely depends on training stage
-- Early in training (steps 0–500), the model is uncertain about almost everything, so EDSD has little effect — it becomes more useful as training progresses past loss ~5-6
-- We haven't measured the actual speedup on CUDA hardware
+| Run | GPU | Steps | Time to val ≤ 3.3821 | Tokens read |
+|---|---|---|---|---|
+| baseline | | | | |
+| Smart Filtering | | | | |
