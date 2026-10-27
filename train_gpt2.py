@@ -15,6 +15,8 @@ import torch.nn.functional as F
 with open(sys.argv[0]) as f:
     code = f.read()
 
+sys.stdout.reconfigure(line_buffering=True)  # show progress live when piped (e.g. into tee on Colab)
+
 # -----------------------------------------------------------------------------
 # Device helpers (CUDA for real runs, MPS/CPU only for smoke tests)
 
@@ -38,7 +40,8 @@ def pick_amp_dtype(device_type):
     """bf16 on Ampere+ (A100/L4/RTX 30xx+), fp16 on older GPUs (T4/V100), none elsewhere."""
     if device_type != "cuda":
         return None
-    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    # is_bf16_supported() also reports emulated bf16 (True on a T4), so check the architecture instead
+    return torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
 
 # -----------------------------------------------------------------------------
